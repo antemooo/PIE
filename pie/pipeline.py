@@ -302,16 +302,22 @@ def run_feature_selection_step(
     df = pd.read_csv(input_csv_path)
     
     # Remove leakage features before any other processing
+    # CRITICAL: Do NOT remove the target column itself, even if listed in leakage features
     if leakage_features_path and Path(leakage_features_path).exists():
         with open(leakage_features_path, 'r') as f:
             leakage_features = {line.strip() for line in f if line.strip()}
         
-        cols_to_drop = [col for col in df.columns if col in leakage_features]
+        # Exclude target column from removal
+        cols_to_drop = [col for col in df.columns if col in leakage_features and col != target_column]
         
         if cols_to_drop:
             df.drop(columns=cols_to_drop, inplace=True)
             logger.info(f"Removed {len(cols_to_drop)} leakage features specified in {leakage_features_path}.")
             report_data['leakage_features_removed'] = ', '.join(cols_to_drop)
+        
+        # Log if target column was in leakage list (should be excluded)
+        if target_column in leakage_features:
+            logger.warning(f"Target column '{target_column}' found in leakage features list but was preserved.")
     
     initial_rows = len(df)
     df.dropna(subset=[target_column], inplace=True)
@@ -327,9 +333,48 @@ def run_feature_selection_step(
     X = df[feature_cols]
     y = df[target_column]
 
+    # CRITICAL: Handle pipe-separated values in target column BEFORE task detection
+    if y.dtype == 'object' or (isinstance(y.iloc[0], str) if len(y) > 0 else False):
+        # Check if target has pipe-separated values
+        if y.astype(str).str.contains(r'\|', na=False).any():
+            logger.info(f"Target column '{target_column}' contains pipe-separated values. Averaging them...")
+            
+            def average_pipe_values(val):
+                if isinstance(val, str) and '|' in val:
+                    try:
+                        return np.mean([float(x) for x in val.split('|')])
+                    except (ValueError, TypeError):
+                        return np.nan
+                return val
+            
+            y = y.apply(average_pipe_values)
+            # Try to convert to numeric
+            y = pd.to_numeric(y, errors='coerce')
+            
+            # Update dataframe with averaged target
+            df[target_column] = y
+            
+            # Drop rows where target became NaN after averaging
+            initial_count = len(df)
+            df = df.dropna(subset=[target_column])
+            if len(df) < initial_count:
+                logger.warning(f"Dropped {initial_count - len(df)} rows where target could not be averaged to numeric value")
+                # Re-extract X and y after dropping rows
+                X = df[feature_cols]
+                y = df[target_column]
+
     # Determine task type based on target dtype
-    is_regression = pd.api.types.is_numeric_dtype(y)
+    # First try to convert to numeric if possible (handles pipe-separated numeric strings)
+    y_for_check = pd.to_numeric(y, errors='coerce')
+    is_regression = y_for_check.notna().sum() > 0 and pd.api.types.is_numeric_dtype(y_for_check)
+    
+    # If not regression, check if it looks like classification
+    if not is_regression:
+        n_unique = y.nunique()
+        is_regression = n_unique > 20  # If more than 20 unique values, treat as regression even if not numeric
+    
     task_type = 'regression' if is_regression else 'classification'
+    logger.info(f"Task type detected: {task_type} (unique values: {y.nunique()}, dtype: {y.dtype})")
 
     # --- Start of new code ---
     # Handle pipe-separated values in object columns that are likely numeric
@@ -524,18 +569,20 @@ def run_regression_step(
     )
 
     # Extract key metrics from report data
+    accuracy = report_data.get('best_accuracy', 'N/A')
     r2 = report_data.get('best_r2', 'N/A')
     mae = report_data.get('best_mae', 'N/A')
     rmse = report_data.get('best_rmse', 'N/A')
     f_score = report_data.get('best_f_score', 'N/A')
 
     logger.info(f"Regression complete. Best model: {report_data.get('best_model_name', 'N/A')}")
-    logger.info(f"R²: {r2}, MAE: {mae}, RMSE: {rmse}, F-Score: {f_score}")
+    logger.info(f"Accuracy: {accuracy if accuracy != 'N/A' else 'N/A'}%, R²: {r2}, MAE: {mae}, RMSE: {rmse}, F-Score: {f_score}")
 
     # Prepare return data for main pipeline report
     report_html_path = reg_dir / "regression_report.html"
     return {
         'report_path': Path(os.path.relpath(report_html_path, output_dir)),
+        'accuracy': accuracy if accuracy != 'N/A' else 0.0,
         'r2': r2 if r2 != 'N/A' else 0.0,
         'mae': mae if mae != 'N/A' else 0.0,
         'rmse': rmse if rmse != 'N/A' else 0.0,
@@ -624,15 +671,28 @@ def generate_main_report(report_data: dict, output_path: Path):
     # --- Regression ---
     if 'regression' in report_data:
         r = report_data['regression']
+        # Format metrics, handling 'N/A' cases
+        accuracy = r.get('accuracy', 'N/A')
+        accuracy_str = f"{accuracy:.2f}%" if isinstance(accuracy, (int, float)) else accuracy
+        r2 = r.get('r2', 'N/A')
+        r2_str = f"{r2:.4f}" if isinstance(r2, (int, float)) else r2
+        mae = r.get('mae', 'N/A')
+        mae_str = f"{mae:.4f}" if isinstance(mae, (int, float)) else mae
+        rmse = r.get('rmse', 'N/A')
+        rmse_str = f"{rmse:.4f}" if isinstance(rmse, (int, float)) else rmse
+        f_score = r.get('f_score', 'N/A')
+        f_score_str = f"{f_score:.4f}" if isinstance(f_score, (int, float)) else f_score
+        
         html_content += f"""
         <div class="stage-box">
             <h2 class="stage-title">4. Regression</h2>
             <table>
                 <tr><th>Metric</th><th>Value</th></tr>
-                <tr><td>R2</td><td><span class=\"metric\">{r.get('r2', 'N/A'):.4f}</span></td></tr>
-                <tr><td>MAE</td><td>{r.get('mae', 'N/A'):.4f}</td></tr>
-                <tr><td>RMSE</td><td>{r.get('rmse', 'N/A'):.4f}</td></tr>
-                <tr><td>F-Score</td><td>{r.get('f_score', 'N/A'):.4f}</td></tr>
+                <tr><td>Accuracy</td><td><span class=\"metric\">{accuracy_str}</span></td></tr>
+                <tr><td>R²</td><td><span class=\"metric\">{r2_str}</span></td></tr>
+                <tr><td>MAE</td><td>{mae_str}</td></tr>
+                <tr><td>RMSE</td><td>{rmse_str}</td></tr>
+                <tr><td>Explained Variance</td><td>{f_score_str}</td></tr>
             </table>
             <a href="{r['report_path']}" target="_blank" class="report-link">View Full Regression Report</a>
         </div>
@@ -691,6 +751,17 @@ def run_pipeline(
             output_html_path=output_path / "data_reduction_report.html",
             modalities=modalities if modalities else ALL_MODALITIES
         )
+        
+        # CRITICAL: Validate target column exists after data reduction
+        if reduced_csv.exists():
+            reduced_df_check = pd.read_csv(reduced_csv, nrows=1)
+            if target_column not in reduced_df_check.columns:
+                logger.error(f"❌ TARGET COLUMN MISSING: '{target_column}' was removed during data reduction!")
+                logger.error(f"   This usually means the column had >95% missing values or was flagged as duplicate.")
+                logger.error(f"   Available columns: {list(reduced_df_check.columns[:10])}... ({len(reduced_df_check.columns)} total)")
+                logger.error(f"   PIPELINE CANNOT CONTINUE. Please choose a different target column.")
+                return
+            logger.info(f"✓ Target column '{target_column}' verified in reduced data")
     
     # --- 2. Feature Engineering ---
     logger.info("\n" + "="*80)
@@ -705,6 +776,17 @@ def run_pipeline(
             output_csv_path=engineered_csv,
             output_html_path=output_path / "feature_engineering_report.html"
         )
+        
+        # CRITICAL: Validate target column still exists after feature engineering
+        if engineered_csv.exists():
+            engineered_df_check = pd.read_csv(engineered_csv, nrows=1)
+            if target_column not in engineered_df_check.columns:
+                logger.error(f"❌ TARGET COLUMN MISSING: '{target_column}' was removed during feature engineering!")
+                logger.error(f"   This is unexpected - feature engineering should preserve all columns.")
+                logger.error(f"   Available columns: {list(engineered_df_check.columns[:10])}... ({len(engineered_df_check.columns)} total)")
+                logger.error(f"   PIPELINE CANNOT CONTINUE. Please investigate feature engineering step.")
+                return
+            logger.info(f"✓ Target column '{target_column}' verified in engineered data")
 
     # --- 3. Feature Selection ---
     logger.info("\n" + "="*80)

@@ -153,6 +153,7 @@ motor_assessments_NP1DPRS
 motor_assessments_NP1ANXS
 motor_assessments_NP1APAT
 motor_assessments_NP1DDS
+motor_assessments_NP1RTOT
 motor_assessments_ORIG_ENTRY
 motor_assessments_LAST_UPDATE
 motor_assessments_REC_ID
@@ -168,6 +169,9 @@ motor_assessments_NP1URIN
 motor_assessments_NP1CNST
 motor_assessments_NP1LTHD
 motor_assessments_NP1FATG
+motor_assessments_NP1PTOT
+motor_assessments_ORIG_ENTRY
+motor_assessments_LAST_UPDATE
 motor_assessments_REC_ID
 motor_assessments_PATNO
 motor_assessments_EVENT_ID
@@ -190,4 +194,3 @@ motor_assessments_NP2FREZ
 motor_assessments_NP2PTOT
 motor_assessments_ORIG_ENTRY
 motor_assessments_LAST_UPDATE
-motor_assessments_NP1PTOT

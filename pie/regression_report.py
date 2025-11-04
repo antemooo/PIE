@@ -134,7 +134,7 @@ def generate_regression_report_html(
         html_content += leaderboard_html
         html_content += """
                 </div>
-                <p><em>Note: Models are ranked by R² score (coefficient of determination). Higher R² indicates better model performance.</em></p>
+                <p><em>Note: Models are ranked by R² score (coefficient of determination) on test data. <strong>Accuracy</strong> shows the percentage of predictions within ±10% tolerance (or ±1.0 for small values). Higher R² and accuracy indicate better model performance.</em></p>
             </div>
         """
 
@@ -152,10 +152,15 @@ def generate_regression_report_html(
                     <tr><th>Metric</th><th>Value</th><th>Interpretation</th></tr>
         """
         
+        accuracy = report_data.get('best_accuracy', 'N/A')
         r2 = report_data.get('best_r2', 'N/A')
         mae = report_data.get('best_mae', 'N/A')
         rmse = report_data.get('best_rmse', 'N/A')
         f_score = report_data.get('best_f_score', 'N/A')
+        
+        if accuracy != 'N/A':
+            acc_interp = "Excellent" if accuracy > 90 else "Good" if accuracy > 75 else "Moderate" if accuracy > 60 else "Poor"
+            html_content += f"<tr><td>Accuracy</td><td class='metric-value'>{accuracy:.2f}%</td><td>{acc_interp} - Predictions within ±10% tolerance</td></tr>"
         
         if r2 != 'N/A':
             r2_interp = "Excellent" if r2 > 0.9 else "Good" if r2 > 0.7 else "Moderate" if r2 > 0.5 else "Poor"
@@ -168,7 +173,7 @@ def generate_regression_report_html(
             html_content += f"<tr><td>Root Mean Squared Error (RMSE)</td><td class='metric-value'>{rmse:.4f}</td><td>Penalizes larger errors more heavily</td></tr>"
         
         if f_score != 'N/A':
-            html_content += f"<tr><td>Explained Variance (F-Score)</td><td class='metric-value'>{f_score:.4f}</td><td>Proportion of variance explained</td></tr>"
+            html_content += f"<tr><td>Explained Variance</td><td class='metric-value'>{f_score:.4f}</td><td>Proportion of variance explained</td></tr>"
         
         html_content += """
                 </table>
@@ -353,6 +358,43 @@ def generate_report(
         logger.error(f"Target column '{target_column}' not found in training data")
         return report_data
 
+    # EXCLUDE SPECIFIED FEATURES EARLY (similar to classification_report.py)
+    # This ensures leakage features are removed even if feature selection didn't catch them
+    if exclude_features:
+        logger.info(f"Excluding {len(exclude_features)} specified features from regression analysis...")
+        
+        # Check which excluded features actually exist in the data
+        # CRITICAL: Never exclude the target column itself
+        existing_excluded_features = [
+            feat for feat in exclude_features 
+            if feat in train_df.columns and feat != target_column
+        ]
+        missing_excluded_features = [
+            feat for feat in exclude_features 
+            if feat not in train_df.columns and feat != target_column
+        ]
+        
+        if existing_excluded_features:
+            logger.info(f"Excluding features from train data: {existing_excluded_features}")
+            train_df = train_df.drop(columns=existing_excluded_features)
+            # Also drop from test data if they exist
+            existing_in_test = [feat for feat in existing_excluded_features if feat in test_df.columns]
+            if existing_in_test:
+                test_df = test_df.drop(columns=existing_in_test)
+            logger.info(f"Train data shape after feature exclusion: {train_df.shape}")
+            logger.info(f"Test data shape after feature exclusion: {test_df.shape}")
+        
+        if missing_excluded_features:
+            logger.warning(f"Specified features not found in data (already removed or never existed): {missing_excluded_features}")
+        
+        # Warn if target column was in exclude list (should not happen after pipeline fix)
+        if target_column in exclude_features:
+            logger.warning(f"Target column '{target_column}' found in exclude_features list but was preserved.")
+        
+        # Update report data
+        report_data['excluded_features'] = existing_excluded_features
+        report_data['excluded_features_count'] = len(existing_excluded_features)
+
     # Prepare features and target
     X_train = train_df.drop(columns=[target_column]).select_dtypes(include=np.number)
     y_train = train_df[target_column]
@@ -423,16 +465,23 @@ def generate_report(
             mae = mean_absolute_error(y_test, y_pred)
             rmse = mean_squared_error(y_test, y_pred, squared=False)
             f_score = explained_variance_score(y_test, y_pred)
+            
+            # Calculate accuracy: percentage of predictions within ±10% tolerance
+            # For values close to zero, use absolute tolerance of ±1.0
+            tolerance = np.maximum(np.abs(y_test) * 0.1, 1.0)
+            within_tolerance = np.abs(y_test - y_pred) <= tolerance
+            accuracy = np.mean(within_tolerance) * 100  # Convert to percentage
 
             leaderboard.append({
                 'Model': name,
+                'Accuracy (%)': accuracy,
                 'R²': r2,
                 'MAE': mae,
                 'RMSE': rmse,
                 'Explained Variance': f_score
             })
 
-            logger.info(f"{name} - R²: {r2:.4f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+            logger.info(f"{name} - Accuracy: {accuracy:.2f}%, R²: {r2:.4f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
 
         except Exception as e:
             logger.warning(f"Model {name} failed: {e}")
@@ -452,12 +501,13 @@ def generate_report(
         y_pred = best_model.predict(X_test)
 
         report_data['best_model_name'] = best_model_name
+        report_data['best_accuracy'] = best_row['Accuracy (%)']
         report_data['best_r2'] = best_row['R²']
         report_data['best_mae'] = best_row['MAE']
         report_data['best_rmse'] = best_row['RMSE']
         report_data['best_f_score'] = best_row['Explained Variance']
 
-        logger.info(f"Best model: {best_model_name} with R²={best_row['R²']:.4f}")
+        logger.info(f"Best model: {best_model_name} with Accuracy={best_row['Accuracy (%)']:.2f}%, Test R²={best_row['R²']:.4f}")
 
         # Save best model
         model_path = output_path / "final_regression_model.pkl"
