@@ -42,7 +42,10 @@ from pie.reporting import (
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.impute import SimpleImputer
-from sklearn.feature_selection import VarianceThreshold, SelectFdr, f_classif
+from sklearn.feature_selection import VarianceThreshold, SelectFdr, f_classif, f_regression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+import joblib
 
 # Configure logging
 logging.basicConfig(
@@ -134,13 +137,70 @@ def _generate_feature_selection_report_html(report_data, output_html_path):
 
 @timing_decorator
 def run_data_reduction_step(data_dir: str, output_csv_path: Path, output_html_path: Path, modalities: Optional[List[str]] = None) -> dict:
+    # Caching: store loaded data_dict as a pickle file
+    cache_dir = Path("output/cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "data_dict.pkl"
+
+    import pickle
+    # Load or create data_dict only in this function
+    if cache_file.exists():
+        logger.info(f"Loading cached data_dict from {cache_file}")
+        with open(cache_file, "rb") as f:
+            loaded = pickle.load(f)
+        if isinstance(loaded, dict):
+            # Ensure all keys are strings
+            data_dict = {str(k): v for k, v in loaded.items()}
+        elif hasattr(loaded, 'to_dict'):
+            logger.warning("Cached data_dict is not a dict, converting using to_dict().")
+            temp_dict = loaded.to_dict()
+            data_dict = {str(k): v for k, v in temp_dict.items()}
+        else:
+            logger.error("Cached data_dict is not a dict or DataFrame. Re-running DataLoader.load...")
+            loaded = DataLoader.load(data_path=data_dir, merge_output=False, modalities=modalities)
+            data_dict = {str(k): v for k, v in loaded.items()}
+            with open(cache_file, "wb") as f:
+                pickle.dump(data_dict, f)
+            logger.info(f"Cached data_dict to {cache_file}")
+    else:
+        logger.info("No cached data_dict found. Running DataLoader.load...")
+        loaded = DataLoader.load(data_path=data_dir, merge_output=False, modalities=modalities)
+        data_dict = {str(k): v for k, v in loaded.items()}
+        with open(cache_file, "wb") as f:
+            pickle.dump(data_dict, f)
+        logger.info(f"Cached data_dict to {cache_file}")
     """Loads, reduces, merges, and consolidates data."""
     logger.info("Starting data loading and reduction step...")
     if not os.path.exists(data_dir):
         logger.error(f"Data directory not found: {data_dir}. Step cannot proceed.")
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
-    data_dict = DataLoader.load(data_path=data_dir, merge_output=False, modalities=modalities)
+    # Caching: store loaded data_dict as a pickle file
+    cache_dir = Path("output/cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "data_dict.pkl"
+
+    import pickle
+    if cache_file.exists():
+        logger.info(f"Loading cached data_dict from {cache_file}")
+        with open(cache_file, "rb") as f:
+            loaded = pickle.load(f)
+        data_dict = loaded
+    else:
+        logger.info("No cached data_dict found. Running DataLoader.load...")
+        data_dict = DataLoader.load(data_path=data_dir, merge_output=False, modalities=modalities)
+        with open(cache_file, "wb") as f:
+            pickle.dump(data_dict, f)
+        logger.info(f"Cached data_dict to {cache_file}")
+
+    # Ensure data_dict is a dict before downstream usage
+    if not isinstance(data_dict, dict):
+        if hasattr(data_dict, 'to_dict'):
+            logger.warning("data_dict is not a dict, converting using to_dict().")
+            data_dict = data_dict.to_dict()
+        else:
+            raise TypeError("data_dict is not a dict and cannot be converted.")
+
     initial_size_mb = _calculate_dict_size(data_dict)
     initial_summary = _get_dict_summary(data_dict)
 
@@ -152,7 +212,7 @@ def run_data_reduction_step(data_dir: str, output_csv_path: Path, output_html_pa
     reduced_size_mb = _calculate_dict_size(reduced_dict)
     reduced_summary = _get_dict_summary(reduced_dict)
 
-    merged_df = reducer.merge_reduced_data(reduced_dict, output_filename=None)
+    merged_df = reducer.merge_reduced_data(reduced_dict, output_filename="merged_temp.csv")
     final_df = reducer.consolidate_cohort_columns(merged_df) if not merged_df.empty else pd.DataFrame()
 
     if not final_df.empty:
@@ -251,12 +311,12 @@ def run_feature_selection_step(
         if cols_to_drop:
             df.drop(columns=cols_to_drop, inplace=True)
             logger.info(f"Removed {len(cols_to_drop)} leakage features specified in {leakage_features_path}.")
-            report_data['leakage_features_removed'] = cols_to_drop
+            report_data['leakage_features_removed'] = ', '.join(cols_to_drop)
     
     initial_rows = len(df)
     df.dropna(subset=[target_column], inplace=True)
-    report_data['rows_dropped_missing_target'] = initial_rows - len(df)
-    report_data['clean_data_shape'] = df.shape
+    report_data['rows_dropped_missing_target'] = str(initial_rows - len(df))
+    report_data['clean_data_shape'] = str(df.shape)
 
     if 'PATNO' in df.columns:
         df['PATNO'] = df['PATNO'].astype(int)
@@ -266,6 +326,10 @@ def run_feature_selection_step(
     
     X = df[feature_cols]
     y = df[target_column]
+
+    # Determine task type based on target dtype
+    is_regression = pd.api.types.is_numeric_dtype(y)
+    task_type = 'regression' if is_regression else 'classification'
 
     # --- Start of new code ---
     # Handle pipe-separated values in object columns that are likely numeric
@@ -281,7 +345,7 @@ def run_feature_selection_step(
             logger.info(f"Skipping pipe-averaging for potential ID/date column: '{col}'")
             continue
 
-        if not X[col].astype(str).str.contains('\|', na=False).any():
+        if not X[col].astype(str).str.contains(r'\|', na=False).any():
             continue
 
         # This column has pipes. Let's see if it's mostly numeric.
@@ -319,30 +383,48 @@ def run_feature_selection_step(
             )
     # --- End of new code ---
 
-    # Impute any remaining NaNs from feature engineering before selection
+    # Drop non-numeric columns BEFORE imputation to avoid shape mismatch
     non_numeric_cols = X.select_dtypes(exclude=np.number).columns
     if len(non_numeric_cols) > 0:
         logger.warning(
-            f"Dropping non-numeric columns before feature selection: {list(non_numeric_cols)}"
+            f"Dropping {len(non_numeric_cols)} non-numeric columns before imputation: {list(non_numeric_cols)}"
         )
         X = X.drop(columns=non_numeric_cols)
 
-    # NOTE: Temporarily skipping SimpleImputer due to a shape mismatch error.
-    # This is a workaround and the imputation strategy should be revisited.
-    logger.warning("Temporarily using fillna(0) instead of SimpleImputer.")
-    X_imputed = X.fillna(0)
+    # Refined imputation: use mean for numeric columns
+    from sklearn.impute import SimpleImputer
+    imputer = SimpleImputer(strategy='mean')
     
-    # Label encode the target for the selector
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y)
+    # Fit and transform, handling potential column drops
+    X_transformed = imputer.fit_transform(X)
+    
+    # Get the feature names that were actually kept by the imputer
+    # SimpleImputer may drop all-NaN columns
+    if hasattr(imputer, 'feature_names_in_'):
+        kept_columns = imputer.feature_names_in_
+    else:
+        # Fallback: assume all columns were kept if no feature_names_in_
+        kept_columns = X.columns
+    
+    # Create DataFrame with only the kept columns
+    X_imputed = pd.DataFrame(X_transformed, columns=kept_columns, index=X.index)
 
-    X_train, X_test, y_train, y_test, y_train_encoded, _ = train_test_split(
-        X_imputed, y, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
-    )
+    # Prepare target and split depending on task type
+    if is_regression:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_imputed, y, test_size=0.2, random_state=42
+        )
+        y_train_encoded = y_train  # for API consistency
+    else:
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(y)
+        X_train, X_test, y_train, y_test, y_train_encoded, _ = train_test_split(
+            X_imputed, y, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+        )
 
     selector = FeatureSelector(
         method=fs_method,
-        task_type='classification',
+        task_type=task_type,
         k_or_frac=fs_param_value if fs_method == 'k_best' else None,
         alpha_fdr=fs_param_value if fs_method == 'fdr' else 0.05
     )
@@ -360,14 +442,16 @@ def run_feature_selection_step(
     logger.info(f"Selected train/test data saved to {train_csv_path} and {test_csv_path}")
 
     report_data.update({
-        'X_train_shape': X_train.shape, 'X_test_shape': X_test.shape,
-        'y_train_shape': y_train.shape, 'y_test_shape': y_test.shape,
-        'num_final_selected_features': X_train_final.shape[1],
-        'final_train_data_shape': train_df.shape,
-        'final_test_data_shape': test_df.shape,
+        'X_train_shape': str(X_train.shape),
+        'X_test_shape': str(X_test.shape),
+        'y_train_shape': str(y_train.shape),
+        'y_test_shape': str(y_test.shape),
+        'num_final_selected_features': str(X_train_final.shape[1]),
+        'final_train_data_shape': str(train_df.shape),
+        'final_test_data_shape': str(test_df.shape),
         'output_train_csv_path': str(train_csv_path),
         'output_test_csv_path': str(test_csv_path),
-        'final_selected_feature_names': selector.selected_feature_names_
+        'final_selected_feature_names': ', '.join(selector.selected_feature_names_)
     })
     _generate_feature_selection_report_html(report_data, str(output_html_path))
 
@@ -379,6 +463,157 @@ def run_feature_selection_step(
         "train_shape": train_df.shape,
         "test_shape": test_df.shape,
         "report_path": report_path
+    }
+
+@timing_decorator
+def run_regression_step(
+    train_csv_path: str,
+    test_csv_path: str,
+    target_column: str,
+    output_dir: Path,
+    generate_plots: bool = True
+) -> dict:
+    """Train a baseline RandomForestRegressor and generate a minimal report and plots."""
+    logger.info("Starting regression modeling step...")
+
+    train_df = pd.read_csv(train_csv_path)
+    test_df = pd.read_csv(test_csv_path)
+
+    if target_column not in train_df.columns:
+        raise ValueError(f"Target column '{target_column}' not found in training data")
+
+    X_train = train_df.drop(columns=[target_column]).select_dtypes(include=np.number)
+    y_train = train_df[target_column]
+    X_test = test_df.drop(columns=[target_column]).select_dtypes(include=np.number)
+    y_test = test_df[target_column]
+
+    # Align columns
+    X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+
+    # Supported regression models
+    from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+    from sklearn.svm import SVR
+    from xgboost import XGBRegressor
+    from lightgbm import LGBMRegressor
+    from catboost import CatBoostRegressor
+    from sklearn.ensemble import RandomForestRegressor
+    models = {
+        'LinearRegression': LinearRegression(),
+        'Ridge': Ridge(),
+        'Lasso': Lasso(),
+        'ElasticNet': ElasticNet(),
+        'SVR': SVR(),
+        'RandomForest': RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1),
+        'XGBoost': XGBRegressor(n_estimators=300, random_state=42, n_jobs=-1, verbosity=0),
+        'LightGBM': LGBMRegressor(n_estimators=300, random_state=42, n_jobs=-1, verbose=-1),
+        'CatBoost': CatBoostRegressor(n_estimators=300, random_state=42, verbose=0)
+    }
+
+    leaderboard = []
+    for name, model in models.items():
+        try:
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
+            rmse = mean_squared_error(y_test, y_pred, squared=False)
+            # F score for regression: use explained variance as a proxy
+            from sklearn.metrics import explained_variance_score
+            f_score = explained_variance_score(y_test, y_pred)
+            leaderboard.append({
+                'Model': name,
+                'R2': r2,
+                'MAE': mae,
+                'RMSE': rmse,
+                'F_score': f_score
+            })
+        except Exception as e:
+            logger.warning(f"Model {name} failed: {e}")
+
+    # Sort leaderboard by R2 descending
+    leaderboard_df = pd.DataFrame(leaderboard).sort_values('R2', ascending=False).reset_index(drop=True)
+    best_row = leaderboard_df.iloc[0]
+    best_model_name = best_row['Model']
+    best_model = models[best_model_name]
+    best_model.fit(X_train, y_train)
+    y_pred = best_model.predict(X_test)
+    r2 = best_row['R2']
+    mae = best_row['MAE']
+    rmse = best_row['RMSE']
+    f_score = best_row['F_score']
+
+    reg_dir = output_dir / "regression"
+    plots_dir = reg_dir / "plots"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = reg_dir / "final_regression_model.pkl"
+    joblib.dump(best_model, model_path)
+    logger.info(f"Saved regression model to {model_path}")
+
+    if generate_plots:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        # Predicted vs Actual
+        plt.figure(figsize=(8, 6))
+        sns.scatterplot(x=y_test, y=y_pred, alpha=0.6)
+        plt.xlabel('Actual')
+        plt.ylabel('Predicted')
+        plt.title('Predicted vs Actual')
+        lims = [min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())]
+        plt.plot(lims, lims, 'r--')
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'pred_vs_actual.png', dpi=200, bbox_inches='tight')
+        plt.close()
+
+        # Residuals
+        residuals = y_test - y_pred
+        plt.figure(figsize=(8, 6))
+        sns.histplot(x=residuals, bins=30, kde=True)
+        plt.title('Residuals Distribution')
+        plt.xlabel('Residual')
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'residuals.png', dpi=200, bbox_inches='tight')
+        plt.close()
+
+    # Enhanced HTML report with leaderboard and metrics
+    report_html = reg_dir / "regression_report.html"
+    leaderboard_html = leaderboard_df.to_html(index=False, float_format=lambda x: f'{x:.4f}', classes='leaderboard-table')
+    html = f"""
+    <!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>PIE Regression Report</title>
+    <style>
+    body{{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:20px}}
+    table,th,td{{border:1px solid #ddd;border-collapse:collapse;padding:8px}}
+    .leaderboard-table th{{background:#007bff;color:#fff}}
+    .leaderboard-table tr:nth-child(1){{background:#d5f4e6;font-weight:bold}}
+    </style>
+    </head><body>
+    <h1>Regression Model Comparison Report</h1>
+    <h2>Leaderboard</h2>
+    {leaderboard_html}
+    <h2>Best Model: {best_model_name}</h2>
+    <table><tr><th>R2</th><th>MAE</th><th>RMSE</th><th>F Score</th></tr>
+    <tr><td>{r2:.4f}</td><td>{mae:.4f}</td><td>{rmse:.4f}</td><td>{f_score:.4f}</td></tr></table>
+    <h2>Plots</h2>
+    <ul>
+      <li><a href='plots/pred_vs_actual.png'>Predicted vs Actual</a></li>
+      <li><a href='plots/residuals.png'>Residuals</a></li>
+    </ul>
+    </body></html>
+    """
+    with open(report_html, 'w', encoding='utf-8') as f:
+        f.write(html)
+
+    return {
+        'report_path': Path(os.path.relpath(report_html, output_dir)),
+        'r2': r2,
+        'mae': mae,
+        'rmse': rmse,
+        'f_score': f_score,
+        'leaderboard': leaderboard_df
     }
 
 def generate_main_report(report_data: dict, output_path: Path):
@@ -456,6 +691,22 @@ def generate_main_report(report_data: dict, output_path: Path):
                 <tr><td>Final Train / Test Shape</td><td>{fs.get('train_shape', 'N/A')} / {fs.get('test_shape', 'N/A')}</td></tr>
             </table>
             <a href="{fs['report_path']}" target="_blank" class="report-link">View Full Selection Report</a>
+        </div>
+        """
+    
+    # --- Regression ---
+    if 'regression' in report_data:
+        r = report_data['regression']
+        html_content += f"""
+        <div class="stage-box">
+            <h2 class="stage-title">4. Regression</h2>
+            <table>
+                <tr><th>Metric</th><th>Value</th></tr>
+                <tr><td>R2</td><td><span class=\"metric\">{r.get('r2', 'N/A'):.4f}</span></td></tr>
+                <tr><td>MAE</td><td>{r.get('mae', 'N/A'):.4f}</td></tr>
+                <tr><td>RMSE</td><td>{r.get('rmse', 'N/A'):.4f}</td></tr>
+            </table>
+            <a href="{r['report_path']}" target="_blank" class="report-link">View Full Regression Report</a>
         </div>
         """
     
@@ -546,43 +797,67 @@ def run_pipeline(
             leakage_features_path=leakage_features_path
         )
 
-    # --- 4. Classification ---
+    # --- 4. Modeling (Classification or Regression) ---
     if not train_csv.exists() or not test_csv.exists():
-        logger.error(f"Train/Test CSVs not found. Cannot run classification. Please run the full pipeline.")
+        logger.error(f"Train/Test CSVs not found. Cannot run modeling. Please run the full pipeline.")
         return
-        
-    logger.info("\n" + "="*80)
-    logger.info("--- STEP 4: CLASSIFICATION ---")
-    logger.info("="*80)
-    classification_output_dir = output_path / "classification"
-    exclude_features = []
-    if leakage_features_path and Path(leakage_features_path).exists():
-        with open(leakage_features_path, 'r') as f:
-            exclude_features = [line.strip() for line in f if line.strip()]
 
-    # Manually time this step as it's not a single decorated function
-    logger.info("--- Timing: Starting 'run_classification_step' ---")
-    start_time_class = time.time()
-    run_classification_step(
-        train_csv_path=str(train_csv),
-        test_csv_path=str(test_csv),
-        use_feature_selection=False,
-        target_column=target_column,
-        exclude_features=exclude_features,
-        output_dir=str(classification_output_dir),
-        n_models_to_compare=n_models_to_compare,
-        tune_best_model=tune_best_model,
-        generate_plots=generate_plots,
-        budget_time_minutes=budget_time_minutes
-    )
-    end_time_class = time.time()
-    logger.info(f"--- Timing: Finished 'run_classification_step' in {end_time_class - start_time_class:.2f} seconds ---")
-    
-    classification_report_path = classification_output_dir / "classification_report.html"
-    relative_classification_report_path = Path(os.path.relpath(classification_report_path, output_path))
-    pipeline_report_data['classification'] = {
-        "report_path": relative_classification_report_path
-    }
+    # Detect task type from selected training data (numeric => regression)
+    selected_train_head = pd.read_csv(train_csv, nrows=5)
+    if target_column not in selected_train_head.columns:
+        logger.error(f"Target column '{target_column}' not found in selected train data.")
+        return
+    is_regression = pd.api.types.is_numeric_dtype(selected_train_head[target_column])
+
+    if is_regression:
+        logger.info("\n" + "="*80)
+        logger.info("--- STEP 4: REGRESSION ---")
+        logger.info("="*80)
+        reg_result = run_regression_step(
+            train_csv_path=str(train_csv),
+            test_csv_path=str(test_csv),
+            target_column=target_column,
+            output_dir=output_path,
+            generate_plots=generate_plots
+        )
+        pipeline_report_data['regression'] = {
+            'report_path': reg_result['report_path'],
+            'r2': reg_result['r2'],
+            'mae': reg_result['mae'],
+            'rmse': reg_result['rmse']
+        }
+    else:
+        logger.info("\n" + "="*80)
+        logger.info("--- STEP 4: CLASSIFICATION ---")
+        logger.info("="*80)
+        classification_output_dir = output_path / "classification"
+        exclude_features = []
+        if leakage_features_path and Path(leakage_features_path).exists():
+            with open(leakage_features_path, 'r') as f:
+                exclude_features = [line.strip() for line in f if line.strip()]
+
+        logger.info("--- Timing: Starting 'run_classification_step' ---")
+        start_time_class = time.time()
+        run_classification_step(
+            train_csv_path=str(train_csv),
+            test_csv_path=str(test_csv),
+            use_feature_selection=False,
+            target_column=target_column,
+            exclude_features=exclude_features,
+            output_dir=str(classification_output_dir),
+            n_models_to_compare=n_models_to_compare,
+            tune_best_model=tune_best_model,
+            generate_plots=generate_plots,
+            budget_time_minutes=budget_time_minutes
+        )
+        end_time_class = time.time()
+        logger.info(f"--- Timing: Finished 'run_classification_step' in {end_time_class - start_time_class:.2f} seconds ---")
+        
+        classification_report_path = classification_output_dir / "classification_report.html"
+        relative_classification_report_path = Path(os.path.relpath(classification_report_path, output_path))
+        pipeline_report_data['classification'] = {
+            "report_path": relative_classification_report_path
+        }
 
     # --- 5. Final Report ---
     logger.info("\n" + "="*80)

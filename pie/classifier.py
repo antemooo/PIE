@@ -44,6 +44,10 @@ class Classifier:
         self.models_dict = {}
         self.comparison_results = None
         self.setup_params = None
+        # Supported regression models for regression tasks
+        self.supported_regressors = [
+            'lr', 'ridge', 'lasso', 'elasticnet', 'svr', 'xgboost', 'lightgbm', 'catboost'
+        ]
         
     def setup_experiment(
         self,

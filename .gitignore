@@ -180,3 +180,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+#Auxiliary files
+.DS_Store
+
+#CSV files
+*.csv
+
+#Copilot files
+*copilot*
