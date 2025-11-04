@@ -189,3 +189,5 @@ cython_debug/
 
 #Copilot files
 *copilot*
+
+outputlog.txt

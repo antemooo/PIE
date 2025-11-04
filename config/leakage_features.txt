@@ -190,3 +190,4 @@ motor_assessments_NP2FREZ
 motor_assessments_NP2PTOT
 motor_assessments_ORIG_ENTRY
 motor_assessments_LAST_UPDATE
+motor_assessments_NP1PTOT

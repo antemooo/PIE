@@ -398,13 +398,27 @@ def run_feature_selection_step(
     # Fit and transform, handling potential column drops
     X_transformed = imputer.fit_transform(X)
     
-    # Get the feature names that were actually kept by the imputer
-    # SimpleImputer may drop all-NaN columns
+    # CRITICAL: SimpleImputer may drop all-NaN columns silently
+    # We need to identify which columns actually survived imputation
+    # The number of columns in X_transformed may be less than X.columns
     if hasattr(imputer, 'feature_names_in_'):
-        kept_columns = imputer.feature_names_in_
+        # Get the columns that the imputer saw during fit
+        input_features = imputer.feature_names_in_
+        # Check if any columns were dropped (all-NaN columns)
+        if X_transformed.shape[1] < len(input_features):
+            # Find which columns have all NaN values and were dropped
+            all_nan_mask = X[input_features].isna().all()
+            kept_columns = input_features[~all_nan_mask]
+        else:
+            kept_columns = input_features
     else:
-        # Fallback: assume all columns were kept if no feature_names_in_
-        kept_columns = X.columns
+        # Fallback: use X.columns but verify shape matches
+        if X_transformed.shape[1] == len(X.columns):
+            kept_columns = X.columns
+        else:
+            # Find non-all-NaN columns manually
+            all_nan_mask = X.isna().all()
+            kept_columns = X.columns[~all_nan_mask]
     
     # Create DataFrame with only the kept columns
     X_imputed = pd.DataFrame(X_transformed, columns=kept_columns, index=X.index)
@@ -471,149 +485,62 @@ def run_regression_step(
     test_csv_path: str,
     target_column: str,
     output_dir: Path,
+    leakage_features_path: str = None,
     generate_plots: bool = True
 ) -> dict:
-    """Train a baseline RandomForestRegressor and generate a minimal report and plots."""
-    logger.info("Starting regression modeling step...")
-
-    train_df = pd.read_csv(train_csv_path)
-    test_df = pd.read_csv(test_csv_path)
-
-    if target_column not in train_df.columns:
-        raise ValueError(f"Target column '{target_column}' not found in training data")
-
-    X_train = train_df.drop(columns=[target_column]).select_dtypes(include=np.number)
-    y_train = train_df[target_column]
-    X_test = test_df.drop(columns=[target_column]).select_dtypes(include=np.number)
-    y_test = test_df[target_column]
-
-    # Align columns
-    X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
-
-    # Supported regression models
-    from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
-    from sklearn.svm import SVR
-    from xgboost import XGBRegressor
-    from lightgbm import LGBMRegressor
-    from catboost import CatBoostRegressor
-    from sklearn.ensemble import RandomForestRegressor
-    models = {
-        'LinearRegression': LinearRegression(),
-        'Ridge': Ridge(),
-        'Lasso': Lasso(),
-        'ElasticNet': ElasticNet(),
-        'SVR': SVR(),
-        'RandomForest': RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1),
-        'XGBoost': XGBRegressor(n_estimators=300, random_state=42, n_jobs=-1, verbosity=0),
-        'LightGBM': LGBMRegressor(n_estimators=300, random_state=42, n_jobs=-1, verbose=-1),
-        'CatBoost': CatBoostRegressor(n_estimators=300, random_state=42, verbose=0)
-    }
-
-    leaderboard = []
-    for name, model in models.items():
-        try:
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            r2 = r2_score(y_test, y_pred)
-            mae = mean_absolute_error(y_test, y_pred)
-            rmse = mean_squared_error(y_test, y_pred, squared=False)
-            # F score for regression: use explained variance as a proxy
-            from sklearn.metrics import explained_variance_score
-            f_score = explained_variance_score(y_test, y_pred)
-            leaderboard.append({
-                'Model': name,
-                'R2': r2,
-                'MAE': mae,
-                'RMSE': rmse,
-                'F_score': f_score
-            })
-        except Exception as e:
-            logger.warning(f"Model {name} failed: {e}")
-
-    # Sort leaderboard by R2 descending
-    leaderboard_df = pd.DataFrame(leaderboard).sort_values('R2', ascending=False).reset_index(drop=True)
-    best_row = leaderboard_df.iloc[0]
-    best_model_name = best_row['Model']
-    best_model = models[best_model_name]
-    best_model.fit(X_train, y_train)
-    y_pred = best_model.predict(X_test)
-    r2 = best_row['R2']
-    mae = best_row['MAE']
-    rmse = best_row['RMSE']
-    f_score = best_row['F_score']
-
-    reg_dir = output_dir / "regression"
-    plots_dir = reg_dir / "plots"
-    reg_dir.mkdir(parents=True, exist_ok=True)
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    model_path = reg_dir / "final_regression_model.pkl"
-    joblib.dump(best_model, model_path)
-    logger.info(f"Saved regression model to {model_path}")
-
-    if generate_plots:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-
-        # Predicted vs Actual
-        plt.figure(figsize=(8, 6))
-        sns.scatterplot(x=y_test, y=y_pred, alpha=0.6)
-        plt.xlabel('Actual')
-        plt.ylabel('Predicted')
-        plt.title('Predicted vs Actual')
-        lims = [min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())]
-        plt.plot(lims, lims, 'r--')
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'pred_vs_actual.png', dpi=200, bbox_inches='tight')
-        plt.close()
-
-        # Residuals
-        residuals = y_test - y_pred
-        plt.figure(figsize=(8, 6))
-        sns.histplot(x=residuals, bins=30, kde=True)
-        plt.title('Residuals Distribution')
-        plt.xlabel('Residual')
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'residuals.png', dpi=200, bbox_inches='tight')
-        plt.close()
-
-    # Enhanced HTML report with leaderboard and metrics
-    report_html = reg_dir / "regression_report.html"
-    leaderboard_html = leaderboard_df.to_html(index=False, float_format=lambda x: f'{x:.4f}', classes='leaderboard-table')
-    html = f"""
-    <!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>PIE Regression Report</title>
-    <style>
-    body{{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:20px}}
-    table,th,td{{border:1px solid #ddd;border-collapse:collapse;padding:8px}}
-    .leaderboard-table th{{background:#007bff;color:#fff}}
-    .leaderboard-table tr:nth-child(1){{background:#d5f4e6;font-weight:bold}}
-    </style>
-    </head><body>
-    <h1>Regression Model Comparison Report</h1>
-    <h2>Leaderboard</h2>
-    {leaderboard_html}
-    <h2>Best Model: {best_model_name}</h2>
-    <table><tr><th>R2</th><th>MAE</th><th>RMSE</th><th>F Score</th></tr>
-    <tr><td>{r2:.4f}</td><td>{mae:.4f}</td><td>{rmse:.4f}</td><td>{f_score:.4f}</td></tr></table>
-    <h2>Plots</h2>
-    <ul>
-      <li><a href='plots/pred_vs_actual.png'>Predicted vs Actual</a></li>
-      <li><a href='plots/residuals.png'>Residuals</a></li>
-    </ul>
-    </body></html>
     """
-    with open(report_html, 'w', encoding='utf-8') as f:
-        f.write(html)
+    Runs comprehensive regression modeling using the regression_report module.
+    
+    This generates a full regression report with model comparison, visualizations,
+    and detailed performance metrics similar to the classification report.
+    """
+    logger.info("Starting comprehensive regression modeling step...")
 
+    # Import the regression report module
+    from pie import regression_report
+
+    # Prepare output directory
+    reg_dir = output_dir / "regression"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load leakage features to exclude
+    exclude_features = []
+    if leakage_features_path and Path(leakage_features_path).exists():
+        try:
+            with open(leakage_features_path, 'r') as f:
+                exclude_features = [line.strip() for line in f if line.strip()]
+            logger.info(f"Loaded {len(exclude_features)} features to exclude from {leakage_features_path}")
+        except Exception as e:
+            logger.warning(f"Could not read leakage features file: {e}")
+
+    # Generate comprehensive regression report
+    report_data = regression_report.generate_report(
+        train_csv_path=train_csv_path,
+        test_csv_path=test_csv_path,
+        target_column=target_column,
+        output_dir=str(reg_dir),
+        exclude_features=exclude_features,
+        generate_plots=generate_plots
+    )
+
+    # Extract key metrics from report data
+    r2 = report_data.get('best_r2', 'N/A')
+    mae = report_data.get('best_mae', 'N/A')
+    rmse = report_data.get('best_rmse', 'N/A')
+    f_score = report_data.get('best_f_score', 'N/A')
+
+    logger.info(f"Regression complete. Best model: {report_data.get('best_model_name', 'N/A')}")
+    logger.info(f"R²: {r2}, MAE: {mae}, RMSE: {rmse}, F-Score: {f_score}")
+
+    # Prepare return data for main pipeline report
+    report_html_path = reg_dir / "regression_report.html"
     return {
-        'report_path': Path(os.path.relpath(report_html, output_dir)),
-        'r2': r2,
-        'mae': mae,
-        'rmse': rmse,
-        'f_score': f_score,
-        'leaderboard': leaderboard_df
+        'report_path': Path(os.path.relpath(report_html_path, output_dir)),
+        'r2': r2 if r2 != 'N/A' else 0.0,
+        'mae': mae if mae != 'N/A' else 0.0,
+        'rmse': rmse if rmse != 'N/A' else 0.0,
+        'f_score': f_score if f_score != 'N/A' else 0.0,
+        'leaderboard': report_data.get('leaderboard')
     }
 
 def generate_main_report(report_data: dict, output_path: Path):
@@ -818,6 +745,7 @@ def run_pipeline(
             test_csv_path=str(test_csv),
             target_column=target_column,
             output_dir=output_path,
+            leakage_features_path=leakage_features_path,
             generate_plots=generate_plots
         )
         pipeline_report_data['regression'] = {
