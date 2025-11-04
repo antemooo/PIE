@@ -632,6 +632,7 @@ def generate_main_report(report_data: dict, output_path: Path):
                 <tr><td>R2</td><td><span class=\"metric\">{r.get('r2', 'N/A'):.4f}</span></td></tr>
                 <tr><td>MAE</td><td>{r.get('mae', 'N/A'):.4f}</td></tr>
                 <tr><td>RMSE</td><td>{r.get('rmse', 'N/A'):.4f}</td></tr>
+                <tr><td>F-Score</td><td>{r.get('f_score', 'N/A'):.4f}</td></tr>
             </table>
             <a href="{r['report_path']}" target="_blank" class="report-link">View Full Regression Report</a>
         </div>
@@ -752,7 +753,8 @@ def run_pipeline(
             'report_path': reg_result['report_path'],
             'r2': reg_result['r2'],
             'mae': reg_result['mae'],
-            'rmse': reg_result['rmse']
+            'rmse': reg_result['rmse'],
+            'f_score': reg_result['f_score']
         }
     else:
         logger.info("\n" + "="*80)
@@ -766,6 +768,8 @@ def run_pipeline(
 
         logger.info("--- Timing: Starting 'run_classification_step' ---")
         start_time_class = time.time()
+        # Classification report returns (classifier, best_model, report_data)
+        # We only need it to generate the report, return value not used in pipeline
         run_classification_step(
             train_csv_path=str(train_csv),
             test_csv_path=str(test_csv),
