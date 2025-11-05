@@ -569,20 +569,18 @@ def run_regression_step(
     )
 
     # Extract key metrics from report data
-    accuracy = report_data.get('best_accuracy', 'N/A')
     r2 = report_data.get('best_r2', 'N/A')
     mae = report_data.get('best_mae', 'N/A')
     rmse = report_data.get('best_rmse', 'N/A')
     f_score = report_data.get('best_f_score', 'N/A')
 
     logger.info(f"Regression complete. Best model: {report_data.get('best_model_name', 'N/A')}")
-    logger.info(f"Accuracy: {accuracy if accuracy != 'N/A' else 'N/A'}%, R²: {r2}, MAE: {mae}, RMSE: {rmse}, F-Score: {f_score}")
+    logger.info(f"R²: {r2}, MAE: {mae}, RMSE: {rmse}, F-Score: {f_score}")
 
     # Prepare return data for main pipeline report
     report_html_path = reg_dir / "regression_report.html"
     return {
         'report_path': Path(os.path.relpath(report_html_path, output_dir)),
-        'accuracy': accuracy if accuracy != 'N/A' else 0.0,
         'r2': r2 if r2 != 'N/A' else 0.0,
         'mae': mae if mae != 'N/A' else 0.0,
         'rmse': rmse if rmse != 'N/A' else 0.0,
@@ -672,8 +670,6 @@ def generate_main_report(report_data: dict, output_path: Path):
     if 'regression' in report_data:
         r = report_data['regression']
         # Format metrics, handling 'N/A' cases
-        accuracy = r.get('accuracy', 'N/A')
-        accuracy_str = f"{accuracy:.2f}%" if isinstance(accuracy, (int, float)) else accuracy
         r2 = r.get('r2', 'N/A')
         r2_str = f"{r2:.4f}" if isinstance(r2, (int, float)) else r2
         mae = r.get('mae', 'N/A')
@@ -688,7 +684,6 @@ def generate_main_report(report_data: dict, output_path: Path):
             <h2 class="stage-title">4. Regression</h2>
             <table>
                 <tr><th>Metric</th><th>Value</th></tr>
-                <tr><td>Accuracy</td><td><span class=\"metric\">{accuracy_str}</span></td></tr>
                 <tr><td>R²</td><td><span class=\"metric\">{r2_str}</span></td></tr>
                 <tr><td>MAE</td><td>{mae_str}</td></tr>
                 <tr><td>RMSE</td><td>{rmse_str}</td></tr>

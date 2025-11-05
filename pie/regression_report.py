@@ -134,7 +134,7 @@ def generate_regression_report_html(
         html_content += leaderboard_html
         html_content += """
                 </div>
-                <p><em>Note: Models are ranked by R² score (coefficient of determination) on test data. <strong>Accuracy</strong> shows the percentage of predictions within ±10% tolerance (or ±1.0 for small values). Higher R² and accuracy indicate better model performance.</em></p>
+                <p><em>Note: Models are ranked by R² score (coefficient of determination) on test data. Higher R² indicates better model performance.</em></p>
             </div>
         """
 
@@ -152,15 +152,10 @@ def generate_regression_report_html(
                     <tr><th>Metric</th><th>Value</th><th>Interpretation</th></tr>
         """
         
-        accuracy = report_data.get('best_accuracy', 'N/A')
         r2 = report_data.get('best_r2', 'N/A')
         mae = report_data.get('best_mae', 'N/A')
         rmse = report_data.get('best_rmse', 'N/A')
         f_score = report_data.get('best_f_score', 'N/A')
-        
-        if accuracy != 'N/A':
-            acc_interp = "Excellent" if accuracy > 90 else "Good" if accuracy > 75 else "Moderate" if accuracy > 60 else "Poor"
-            html_content += f"<tr><td>Accuracy</td><td class='metric-value'>{accuracy:.2f}%</td><td>{acc_interp} - Predictions within ±10% tolerance</td></tr>"
         
         if r2 != 'N/A':
             r2_interp = "Excellent" if r2 > 0.9 else "Good" if r2 > 0.7 else "Moderate" if r2 > 0.5 else "Poor"
@@ -465,23 +460,16 @@ def generate_report(
             mae = mean_absolute_error(y_test, y_pred)
             rmse = mean_squared_error(y_test, y_pred, squared=False)
             f_score = explained_variance_score(y_test, y_pred)
-            
-            # Calculate accuracy: percentage of predictions within ±10% tolerance
-            # For values close to zero, use absolute tolerance of ±1.0
-            tolerance = np.maximum(np.abs(y_test) * 0.1, 1.0)
-            within_tolerance = np.abs(y_test - y_pred) <= tolerance
-            accuracy = np.mean(within_tolerance) * 100  # Convert to percentage
 
             leaderboard.append({
                 'Model': name,
-                'Accuracy (%)': accuracy,
                 'R²': r2,
                 'MAE': mae,
                 'RMSE': rmse,
                 'Explained Variance': f_score
             })
 
-            logger.info(f"{name} - Accuracy: {accuracy:.2f}%, R²: {r2:.4f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+            logger.info(f"{name} - R²: {r2:.4f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
 
         except Exception as e:
             logger.warning(f"Model {name} failed: {e}")
@@ -501,13 +489,12 @@ def generate_report(
         y_pred = best_model.predict(X_test)
 
         report_data['best_model_name'] = best_model_name
-        report_data['best_accuracy'] = best_row['Accuracy (%)']
         report_data['best_r2'] = best_row['R²']
         report_data['best_mae'] = best_row['MAE']
         report_data['best_rmse'] = best_row['RMSE']
         report_data['best_f_score'] = best_row['Explained Variance']
 
-        logger.info(f"Best model: {best_model_name} with Accuracy={best_row['Accuracy (%)']:.2f}%, Test R²={best_row['R²']:.4f}")
+        logger.info(f"Best model: {best_model_name} with Test R²={best_row['R²']:.4f}")
 
         # Save best model
         model_path = output_path / "final_regression_model.pkl"
